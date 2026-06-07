@@ -1,7 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import subprocess, os, uuid, tempfile, shutil
+import subprocess, os, uuid, asyncio
 
 app = FastAPI()
 
@@ -23,8 +23,15 @@ def root():
 def health():
     return {"ok": True}
 
+def cleanup(job_dir):
+    import shutil, time
+    time.sleep(300)
+    try: shutil.rmtree(job_dir)
+    except: pass
+
 @app.post("/process")
 async def process_video(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     silence_thresh: float = Form(-35.0),
     silence_duration: float = Form(0.5),
@@ -36,21 +43,29 @@ async def process_video(
 
     input_path  = os.path.join(job_dir, "input.mp4")
     output_path = os.path.join(job_dir, "output.mp4")
-    segments_path = os.path.join(job_dir, "segments.txt")
 
     try:
-        # Save uploaded file
+        # Save uploaded file in chunks — يدعم الملفات الكبيرة
         with open(input_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                f.write(chunk)
 
-        # Detect silence using ffmpeg silencedetect
+        file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+
+        # Get video duration
+        dur_cmd = ["ffprobe","-v","quiet","-show_entries",
+                   "format=duration","-of","csv=p=0", input_path]
+        dur_result = subprocess.run(dur_cmd, capture_output=True, text=True)
+        try: duration = float(dur_result.stdout.strip())
+        except: duration = 60.0
+
+        # Detect silence
         detect_cmd = [
             "ffmpeg", "-i", input_path,
             "-af", f"silencedetect=noise={silence_thresh}dB:d={silence_duration}",
             "-f", "null", "-"
         ]
-        result = subprocess.run(detect_cmd, capture_output=True, text=True)
+        result = subprocess.run(detect_cmd, capture_output=True, text=True, timeout=600)
         stderr = result.stderr
 
         # Parse silence intervals
@@ -63,53 +78,66 @@ async def process_video(
                 try: silence_ends.append(float(line.split("silence_end: ")[1].split("|")[0].strip()))
                 except: pass
 
-        # Get video duration
-        dur_cmd = ["ffprobe","-v","quiet","-show_entries","format=duration","-of","csv=p=0", input_path]
-        dur_result = subprocess.run(dur_cmd, capture_output=True, text=True)
-        try: duration = float(dur_result.stdout.strip())
-        except: duration = 60.0
-
-        # Build keep segments (non-silent parts)
+        # Build keep segments
         keep_segments = []
         prev = 0.0
         for start, end in zip(silence_starts, silence_ends):
             if start > prev + 0.1:
-                keep_segments.append((prev, start))
+                keep_segments.append((round(prev, 3), round(start, 3)))
             prev = end
         if prev < duration - 0.1:
-            keep_segments.append((prev, duration))
+            keep_segments.append((round(prev, 3), round(duration, 3)))
 
         if not keep_segments:
             keep_segments = [(0, duration)]
 
-        # Build FFmpeg filter for cutting
-        filter_parts = []
-        concat_v, concat_a = "", ""
-        for i, (s, e) in enumerate(keep_segments):
-            filter_parts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]")
-            filter_parts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]")
-            concat_v += f"[v{i}]"
-            concat_a += f"[a{i}]"
+        # إذا كان الفيديو طويلاً — نستخدم concat file method (أسرع وأستقر)
+        if len(keep_segments) > 0:
+            # كتابة ملف القطع
+            segments_file = os.path.join(job_dir, "segments.txt")
+            
+            # نقص كل جزء على حدة ثم ندمجهم
+            part_files = []
+            for i, (s, e) in enumerate(keep_segments):
+                part_path = os.path.join(job_dir, f"part_{i}.mp4")
+                cut_cmd = [
+                    "ffmpeg", "-i", input_path,
+                    "-ss", str(s), "-to", str(e),
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac",
+                    "-avoid_negative_ts", "1",
+                    "-y", part_path
+                ]
+                subprocess.run(cut_cmd, capture_output=True, timeout=600)
+                if os.path.exists(part_path):
+                    part_files.append(part_path)
 
-        n = len(keep_segments)
-        filter_parts.append(f"{concat_v}{concat_a}concat=n={n}:v=1:a=1[outv][outa]")
-        filter_complex = ";".join(filter_parts)
-
-        # Run FFmpeg cut
-        cut_cmd = [
-            "ffmpeg", "-i", input_path,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "fast",
-            "-c:a", "aac", "-y", output_path
-        ]
-        cut_result = subprocess.run(cut_cmd, capture_output=True, text=True, timeout=300)
+            if len(part_files) == 1:
+                # جزء واحد فقط
+                os.rename(part_files[0], output_path)
+            elif len(part_files) > 1:
+                # دمج الأجزاء
+                with open(segments_file, "w") as f:
+                    for pf in part_files:
+                        f.write(f"file '{pf}'\n")
+                
+                merge_cmd = [
+                    "ffmpeg",
+                    "-f", "concat", "-safe", "0",
+                    "-i", segments_file,
+                    "-c", "copy",
+                    "-y", output_path
+                ]
+                subprocess.run(merge_cmd, capture_output=True, timeout=600)
 
         if not os.path.exists(output_path):
-            return JSONResponse({"error": "فشل في معالجة الفيديو", "details": cut_result.stderr[-500:]}, status_code=500)
+            return JSONResponse({"error": "فشل في معالجة الفيديو"}, status_code=500)
 
-        cut_duration = duration - sum(e-s for s,e in zip(silence_starts, silence_ends))
-        saved = duration - cut_duration
+        cut_secs = sum(e - s for s, e in zip(silence_starts, silence_ends))
+        new_dur = max(0, duration - cut_secs)
+        output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+
+        background_tasks.add_task(cleanup, job_dir)
 
         return FileResponse(
             output_path,
@@ -117,20 +145,15 @@ async def process_video(
             filename="silentcut_output.mp4",
             headers={
                 "X-Original-Duration": str(round(duration, 2)),
-                "X-Cut-Duration": str(round(cut_duration, 2)),
-                "X-Saved-Seconds": str(round(saved, 2)),
+                "X-Cut-Duration": str(round(new_dur, 2)),
+                "X-Saved-Seconds": str(round(cut_secs, 2)),
                 "X-Segments-Cut": str(len(silence_starts)),
+                "X-File-Size-MB": str(round(output_size_mb, 1)),
+                "Access-Control-Expose-Headers": "X-Original-Duration,X-Cut-Duration,X-Saved-Seconds,X-Segments-Cut,X-File-Size-MB"
             }
         )
 
     except subprocess.TimeoutExpired:
-        return JSONResponse({"error": "انتهت مهلة المعالجة — الفيديو كبير جداً"}, status_code=408)
+        return JSONResponse({"error": "انتهت مهلة المعالجة — الفيديو طويل جداً، جرب تقليل مدته"}, status_code=408)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-    finally:
-        # Cleanup after 5 min (background)
-        pass
-
-@app.get("/detect")
-async def detect_only():
-    return {"message": "استخدم POST /process لرفع الفيديو"}
